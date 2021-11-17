@@ -54,10 +54,13 @@
 #include <sys/ktrace.h>
 #endif
 
-
+/* Processes can sleep on lbolt in order to sleep for a time period
+   of one second. */
 int	lbolt;			/* once a second sleep address */
 int	rrticks_init;		/* # of hardclock ticks per roundrobin() */
 
+/* This relates to the introduction of 4.3 BSD. 4.3 BSD implemented
+some multiprocessor support by utilizing a giant lock on the kernel. */
 #ifdef MULTIPROCESSOR
 struct __mp_lock sched_lock;
 #endif
@@ -67,14 +70,16 @@ uint32_t		decay_aftersleep(uint32_t, uint32_t);
 
 /*
  * Force switch among equal priority processes every 100ms.
+ * This is an involuntary context switch.
  */
 void
 roundrobin(struct cpu_info *ci)
 {
+	
 	struct schedstate_percpu *spc = &ci->ci_schedstate;
 
 	spc->spc_rrticks = rrticks_init;
-
+	
 	if (ci->ci_curproc != NULL) {
 		if (spc->spc_schedflags & SPCF_SEENRR) {
 			/*
@@ -82,6 +87,10 @@ roundrobin(struct cpu_info *ci)
 			 * without switching and may be hogging the CPU.
 			 * Indicate that the process should yield.
 			 */
+			/* This is an involuntary context switch. Here
+			   we are setting a schedule flag on the CPU state itself
+			   indicating that the current process should be dropped from
+			   the queue, and rescheduled. */
 			atomic_setbits_int(&spc->spc_schedflags,
 			    SPCF_SHOULDYIELD);
 		} else {
@@ -89,7 +98,10 @@ roundrobin(struct cpu_info *ci)
 			    SPCF_SEENRR);
 		}
 	}
-
+	
+	// indicate that the CPU needs rescheduling
+	// If there are still processeson the runqueue then
+	// reschedule the current CPU.
 	if (spc->spc_nrun)
 		need_resched(ci);
 }
@@ -181,6 +193,11 @@ fixpt_t	ccpu = 0.95122942450071400909 * FSCALE;		/* exp(-1/20) */
 
 /*
  * Recompute process priorities, every second.
+ * When a CPU bound process spends more time 
+ * executing as a CPU bound process than it does
+ * sleeping then it will be dropped priority here.
+ * Conversely if the CPU bound process is now being starved
+ * then the calculated decay will raise the priority of the process.
  */
 void
 schedcpu(void *arg)
@@ -201,6 +218,13 @@ schedcpu(void *arg)
 	phz = stathz ? stathz : profhz;
 	KASSERT(phz);
 
+	// This is a linked list macr
+	// Iterate over all processes in allproc list
+	// This is all processes in queues and processes 
+	// that are sleeping 
+	// This is the O(n) problem I was talking about in
+	// the disadvantages. We have to iterate over
+	// every process that is alive / sleeping
 	LIST_FOREACH(p, &allproc, p_list) {
 		/*
 		 * Idle threads are never placed on the runqueue,
@@ -211,16 +235,27 @@ schedcpu(void *arg)
 			continue;
 		/*
 		 * Increment sleep time (if sleeping). We ignore overflow.
+		 * Here we are incrementing the sleep time every second.
+		 * This means that the process is in the sleep queue.
+		 * This is used when the process wakes up to estimate
+		 * the new CPU utilization of the process.
 		 */
 		if (p->p_stat == SSLEEP || p->p_stat == SSTOP)
 			p->p_slptime++;
+		
 		p->p_pctcpu = (p->p_pctcpu * ccpu) >> FSHIFT;
+		
 		/*
 		 * If the process has slept the entire second,
 		 * stop recalculating its priority until it wakes up.
+		 * This is an optimization, there is no point calculating
+		 * a process' sleep time when it is asleep.
 		 */
 		if (p->p_slptime > 1)
 			continue;
+		
+		// Acquire the schedule lock. We are about to modify
+		// the state of the runqueue
 		SCHED_LOCK(s);
 		/*
 		 * p_pctcpu is only for diagnostic tools such as ps.
@@ -235,18 +270,37 @@ schedcpu(void *arg)
 			(p->p_cpticks * FSCALE / phz)) >> FSHIFT;
 #endif
 		p->p_cpticks = 0;
+		
+		// Here we decay the CPU utilizaiton. This means
+		// if the number of CPU ticks stops accumulating then
+		// the priority of the process will be reduced.
 		newcpu = (u_int) decay_cpu(loadfac, p->p_estcpu);
+		
+		// Evaluate the new priority of the CPU process
+		// based on the new estimated CPU utilization
 		setpriority(p, newcpu, p->p_p->ps_nice);
 
+		// If the process is runnable and it's priority no longer
+		// corresponds to the same queue then remove the process
+		// from the run queue and add it to the new queue
 		if (p->p_stat == SRUN &&
 		    (p->p_runpri / SCHED_PPQ) != (p->p_usrpri / SCHED_PPQ)) {
 			remrunqueue(p);
 			setrunqueue(p->p_cpu, p, p->p_usrpri);
 		}
+		
+		// We are no longer modifying the shared run queue
+		// unlock the schedule lock so other processes can
+		// modify it
 		SCHED_UNLOCK(s);
-	}
+	} // CONTINUE TO NEXT ITERATION
 	uvm_meter();
-	wakeup(&lbolt);
+	wakeup(&lbolt); // Wake up the lbolt which is awoken once a second
+	
+	// Add one second to the timeout
+	// This means that the current method
+	// will execute again in one second
+	// ... so the cycle continues.....
 	timeout_add_sec(to, 1);
 }
 
@@ -254,6 +308,8 @@ schedcpu(void *arg)
  * Recalculate the priority of a process after it has slept for a while.
  * For all load averages >= 1 and max p_estcpu of 255, sleeping for at
  * least six times the loadfactor will decay p_estcpu to zero.
+ * After a process has been sleeping for a long time it's user user priority needs
+ * to be decayed. This is done in this method
  */
 uint32_t
 decay_aftersleep(uint32_t estcpu, uint32_t slptime)
@@ -262,11 +318,15 @@ decay_aftersleep(uint32_t estcpu, uint32_t slptime)
 	uint32_t newcpu;
 
 	if (slptime > 5 * loadfac)
+		// If the process has been sleeping for a really long time
+		// in terms of the load factor it is likely the user has been
+		// waiting on the process for long time. Therefore we need to reset
+		// the cpu utilization
 		newcpu = 0;
 	else {
 		newcpu = estcpu;
-		slptime--;	/* the first time was done in schedcpu */
-		while (newcpu && --slptime)
+		slptime--;	
+		while (newcpu && --slptime) // Decay the CPU utilization to the power of n times
 			newcpu = decay_cpu(loadfac, newcpu);
 
 	}
@@ -283,7 +343,10 @@ yield(void)
 {
 	struct proc *p = curproc;
 	int s;
-
+	
+	// Once again notice the schedule lock. This 
+	// is required so that other CPUs don't modify the
+	// run queue (introduced since BSD 3)
 	SCHED_LOCK(s);
 	setrunqueue(p->p_cpu, p, p->p_usrpri);
 	p->p_ru.ru_nvcsw++;
@@ -310,12 +373,19 @@ preempt(void)
 	SCHED_UNLOCK(s);
 }
 
+/*
+ * Machine independent code for performing a context switch.
+ * This can occur when a process has used up it's time slice
+ * When a process is about to sleep and so on.
+*/	
 void
 mi_switch(void)
 {
 	struct schedstate_percpu *spc = &curcpu()->ci_schedstate;
 	struct proc *p = curproc;
 	struct proc *nextproc;
+	// This is the actual process struct
+	// of the process
 	struct process *pr = p->p_p;
 	struct timespec ts;
 #ifdef MULTIPROCESSOR
@@ -326,6 +396,9 @@ mi_switch(void)
 	assertwaitok();
 	KASSERT(p->p_stat != SONPROC);
 
+	// About to modify the run queue and the currently modified process
+	// assert that a lock is held so that we know that another CPU isn't
+	// modifying the same run queue
 	SCHED_ASSERT_LOCKED();
 
 #ifdef MULTIPROCESSOR
@@ -353,7 +426,12 @@ mi_switch(void)
 		    spc->spc_runtime.tv_nsec);
 #endif
 	} else {
+		// Calculate the difference between when the process finished
+		// it's time slice and when it started it's time slice - which
+		// represents the total time the process was executing for
 		timespecsub(&ts, &spc->spc_runtime, &ts);
+		// Add the total time the process was executing for
+		// to it's run time
 		timespecadd(&p->p_rtime, &ts, &p->p_rtime);
 	}
 
@@ -366,19 +444,27 @@ mi_switch(void)
 	 */
 	atomic_clearbits_int(&spc->spc_schedflags, SPCF_SWITCHCLEAR);
 
+	// Choose the next process in the a run queue to execute.
+	// This will be a process in a high priority queue.
 	nextproc = sched_chooseproc();
 
 	if (p != nextproc) {
 		uvmexp.swtch++;
 		TRACEPOINT(sched, off__cpu, nextproc->p_tid + THREAD_PID_OFFSET,
 		    nextproc->p_p->ps_pid);
+		// Remove the current process from executing in the current CPU
+		// and add the next process to the current CPU
 		cpu_switchto(p, nextproc);
 		TRACEPOINT(sched, on__cpu, NULL);
 	} else {
+		// The next proceess is the highest priority process
+		// Leave this queue as the executing process
+		// This can happen when the process is still the highest priority
 		TRACEPOINT(sched, remain__cpu, NULL);
 		p->p_stat = SONPROC;
 	}
 
+	// Clear the needs rescheduling flag of the current CPU
 	clear_resched(curcpu());
 
 	SCHED_ASSERT_LOCKED();
@@ -453,8 +539,10 @@ setrunnable(struct proc *p)
 		unsleep(p);		/* e.g. when sending signals */
 		break;
 	}
+	
+	// Assignt the process to the run queue
 	setrunqueue(NULL, p, prio);
-	if (p->p_slptime > 1) {
+	if (p->p_slptime > 1) { // If the sleep time is greater than a second we need to estimate the enw decay time.
 		uint32_t newcpu;
 
 		newcpu = decay_aftersleep(p->p_estcpu, p->p_slptime);
