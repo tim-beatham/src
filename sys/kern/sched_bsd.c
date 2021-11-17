@@ -558,11 +558,17 @@ void
 setpriority(struct proc *p, uint32_t newcpu, uint8_t nice)
 {
 	unsigned int newprio;
-
+	
+	// Calculate the new priority
+	// The minimum of such a priority is the minimum time sharing process priority
+	// and the maximum is the maximum time sharing process priority
 	newprio = min((PUSER + newcpu + NICE_WEIGHT * (nice - NZERO)), MAXPRI);
 
 	SCHED_ASSERT_LOCKED();
+	// Update the estimateed CPU utilization
 	p->p_estcpu = newcpu;
+	
+	// Update the user priority.
 	p->p_usrpri = newprio;
 }
 
@@ -592,7 +598,12 @@ schedclock(struct proc *p)
 		return;
 
 	SCHED_LOCK(s);
+	// Increment the cpu utilization by one tick
+	// This will cause processes that use up a full-time
+	// slice to decrease in priority.
 	newcpu = ESTCPULIM(p->p_estcpu + 1);
+	
+	// Update the priority
 	setpriority(p, newcpu, p->p_p->ps_nice);
 	SCHED_UNLOCK(s);
 }
@@ -761,12 +772,17 @@ scheduler_start(void)
 	/*
 	 * We avoid polluting the global namespace by keeping the scheduler
 	 * timeouts static in this function.
-	 * We setup the timeout here and kick schedcpu once to make it do
-	 * its job.
+	 * We setup the timeout here so that the schedcpu executes every second
+	 * which causes priorities to be recalculated and the current process to be rescheduled.
 	 */
+	
+	// schedcpu will be called every second
 	timeout_set(&schedcpu_to, schedcpu, &schedcpu_to);
 
 	rrticks_init = hz / 10;
+	
+	// Make an initial call to schedcpu. This kicks of the loop
+	// where schedcpu executes every second
 	schedcpu(&schedcpu_to);
 
 #ifndef SMALL_KERNEL
