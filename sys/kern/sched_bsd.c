@@ -91,6 +91,7 @@ roundrobin(struct cpu_info *ci)
 			   we are setting a schedule flag on the CPU state itself
 			   indicating that the current process should be dropped from
 			   the queue, and rescheduled. */
+			// This is an asynchronous system trap.
 			atomic_setbits_int(&spc->spc_schedflags,
 			    SPCF_SHOULDYIELD);
 		} else {
